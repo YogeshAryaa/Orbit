@@ -7,3 +7,5 @@ export async function sendVerifyOtp(req,res){if(!req.user.email)throw new ApiErr
 export async function verifyOtp(req,res){ok(res,await verifyEmail(req.validated.body.email,req.validated.body.code),'Email verified');}
 export async function sendResetOtp(req,res){ok(res,await requestOtp(req.validated.body.email,'reset'),'If account exists and email is configured, code sent');}
 export async function reset(req,res){ok(res,await resetPassword(req.validated.body.email,req.validated.body.code,req.validated.body.newPassword),'Password reset');}
+export async function updatePassword(req,res){const {changePassword}=await import('../services/authService.js');ok(res,await changePassword(req.user.id,req.validated.body.currentPassword,req.validated.body.newPassword),'Password updated');}
+

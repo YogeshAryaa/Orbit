@@ -1,4 +1,4 @@
-# Real-Time Chat Backend v3 — E2EE + Redis scale-out
+# Orbit — Real-Time Chat Backend v3 (E2EE + Redis scale-out)
 
 Node.js 20+, Express, MongoDB/Mongoose, Socket.IO, Redis, JWT sessions, email OTP, Cloudinary, Web Push, and client-side Web Crypto encryption.
 
