@@ -50,7 +50,7 @@ Client events:
 - `conversation:join` `{conversationId}`; ack `{success,data}`.
 - `typing:start`, `typing:stop` `{conversationId}`; ack `{success}`; other room members receive `typing:update`.
 - `message:delivered` `{conversationId,messageIds:[...]}`; ack `{success}`; room gets `receipt:delivered`.
-- `call:signal` `{conversationId,signal:{type:"offer|answer|ice-candidate|reject|busy|end",...}}`; direct chats only; recipient gets `call:signal`.
+- `call:signal` routes authenticated WebRTC signaling to conversation members. Direct chats accept `{conversationId,signal:{type:"offer|answer|ice-candidate|reject|busy|end",...}}`. Group calls also accept `{conversationId,toUserId?,signal:{type:"invite|join|offer|answer|ice-candidate|reject|busy|leave",callId,...}}`; group signals are relayed to members (or the specified member), subject to block settings. Group media uses peer-to-peer mesh; deploy an SFU for larger calls.
 Server events: `message:new`, `message:updated`, `message:deleted`, `message:reaction`, `receipt:read`, `receipt:delivered`, `presence:online`, `presence:offline`, `typing:update`, `call:signal`.
 
 ## Axios example
@@ -66,7 +66,7 @@ export const socket=io('http://localhost:5000',{autoConnect:false,auth:cb=>cb({t
 ```
 
 ## External services and limitations
-SMTP is needed for email OTP/reset. SMS OTP is not included. VAPID keys and browser subscriptions are needed for Web Push. Cloudinary credentials provide durable media. Configure STUN/TURN for calls; group calls require SFU infrastructure. This project is not end-to-end encrypted. In-memory revocation/presence require Redis/shared adapter for multiple instances. Review and integration-test before production.
+SMTP is needed for email OTP/reset. SMS OTP is not included. VAPID keys and browser subscriptions are needed for Web Push. Cloudinary credentials provide durable media. Configure STUN/TURN for calls; group calls use peer-to-peer mesh, which scales poorly as participants increase, and an SFU is recommended for larger calls. This project is not end-to-end encrypted. In-memory revocation/presence require Redis/shared adapter for multiple instances. Review and integration-test before production.
 
 
 ## E2EE device keys

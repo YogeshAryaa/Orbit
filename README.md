@@ -55,5 +55,5 @@ This is a practical browser E2EE baseline, **not a drop-in implementation of the
 - Email verification/password reset require SMTP. SMS OTP is not implemented because no provider was specified.
 - Cloudinary is required by this multi-instance build in production so encrypted uploads are shared; local upload storage is development-only. In E2EE mode the uploaded bytes must already be encrypted by the client.
 - Web Push notifications are generic and never contain message plaintext.
-- WebRTC signaling relays call setup; media encryption is provided by WebRTC's DTLS-SRTP, not by this E2EE message helper. Group calls need an SFU.
+- WebRTC signaling relays direct and group call setup; group calls use a peer-to-peer mesh, while an SFU is recommended for larger groups. Media encryption is provided by WebRTC's DTLS-SRTP, not by this E2EE message helper.
 - Run integration tests with dedicated MongoDB and Redis instances before production. This ZIP has syntax and unit tests but cannot verify your cloud credentials or deployment configuration.
