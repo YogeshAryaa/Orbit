@@ -98,7 +98,11 @@ export async function decryptMessage(payload, deviceId, privateJwks) {
   const rawContentKey = await crypto.subtle.decrypt({name:'AES-GCM', iv:fromB64(envelope.keyNonce)}, wrapKey, fromB64(envelope.encryptedKey));
   const contentKey = await crypto.subtle.importKey('raw', rawContentKey, {name:'AES-GCM'}, false, ['decrypt']);
   const clear = await crypto.subtle.decrypt({name:'AES-GCM', iv:fromB64(payload.nonce)}, contentKey, fromB64(payload.ciphertext));
-  if (useOneTime) delete privateJwks.oneTimePreKeys[envelope.oneTimePreKeyId];
+  if (useOneTime) {
+    if (!privateJwks.consumedOneTimePreKeys) privateJwks.consumedOneTimePreKeys = {};
+    privateJwks.consumedOneTimePreKeys[envelope.oneTimePreKeyId] = privateJwks.oneTimePreKeys[envelope.oneTimePreKeyId];
+    delete privateJwks.oneTimePreKeys[envelope.oneTimePreKeyId];
+  }
   return dec.decode(clear);
 }
 
@@ -118,4 +122,40 @@ export async function decryptFile(encryptedArrayBuffer, metadata) {
   const key = await crypto.subtle.importKey('raw', fromB64(metadata.key), {name:'AES-GCM'}, false, ['decrypt']);
   const clear = await crypto.subtle.decrypt({name:'AES-GCM', iv:fromB64(metadata.nonce)}, key, encryptedArrayBuffer);
   return new Blob([clear], {type:metadata.mimeType || 'application/octet-stream'});
+}
+
+export async function extractContentKey(payload, deviceId, privateJwks) {
+  if (payload?.version !== 1 || payload?.algorithm !== 'ECDH-P256-HKDF-SHA256-AES256GCM') {
+    throw new Error('Unsupported encrypted message format');
+  }
+  const envelope = payload.recipientEnvelopes?.find(e => e.recipientDeviceId === deviceId);
+  if (!envelope) throw new Error('This message was not encrypted for this device');
+  const useOneTime = envelope.oneTimePreKeyId && (privateJwks.oneTimePreKeys?.[envelope.oneTimePreKeyId] || privateJwks.consumedOneTimePreKeys?.[envelope.oneTimePreKeyId]);
+  const privateJwk = useOneTime ? (privateJwks.oneTimePreKeys?.[envelope.oneTimePreKeyId] || privateJwks.consumedOneTimePreKeys?.[envelope.oneTimePreKeyId]) : privateJwks.signedPreKeyPrivateKey;
+  if (!privateJwk) throw new Error('Required private key is unavailable on this device');
+
+  const privateKey = await crypto.subtle.importKey('jwk', privateJwk, {name:'ECDH', namedCurve:'P-256'}, false, ['deriveBits']);
+  const ephemeralPublic = await importEcdhPublic(envelope.ephemeralPublicKey);
+  const wrapKey = await deriveWrappingKey(privateKey, ephemeralPublic, fromB64(envelope.salt));
+  const rawContentKey = await crypto.subtle.decrypt({name:'AES-GCM', iv:fromB64(envelope.keyNonce)}, wrapKey, fromB64(envelope.encryptedKey));
+  return new Uint8Array(rawContentKey);
+}
+
+export async function createEnvelopeForDevice(rawContentKey, targetBundle) {
+  const oneTime = targetBundle.oneTimePreKey;
+  const recipientPublic = await importEcdhPublic(oneTime?.publicKey || targetBundle.signedPreKeyPublic);
+  const ephemeral = await crypto.subtle.generateKey({name:'ECDH', namedCurve:'P-256'}, true, ['deriveBits']);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const wrap = await deriveWrappingKey(ephemeral.privateKey, recipientPublic, salt);
+  const keyNonce = crypto.getRandomValues(new Uint8Array(12));
+  const rawBytes = rawContentKey instanceof Uint8Array ? rawContentKey : new Uint8Array(rawContentKey);
+  const encryptedKey = await crypto.subtle.encrypt({name:'AES-GCM', iv:keyNonce}, wrap, rawBytes);
+  return {
+    recipientDeviceId: targetBundle.deviceId,
+    oneTimePreKeyId: oneTime?.keyId || null,
+    ephemeralPublicKey: await exportPublic(ephemeral.publicKey),
+    salt: toB64(salt),
+    keyNonce: toB64(keyNonce),
+    encryptedKey: toB64(encryptedKey)
+  };
 }
