@@ -6,6 +6,8 @@ const schema=new mongoose.Schema({
  avatarUrl:{type:String,default:''},statusMessage:{type:String,default:'',maxlength:140},discoverableByPhone:{type:Boolean,default:true},
  emailVerified:{type:Boolean,default:false},blockedUsers:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],
  privacy:{lastSeen:{type:String,enum:['everyone','contacts','nobody'],default:'everyone'},profilePhoto:{type:String,enum:['everyone','contacts','nobody'],default:'everyone'},readReceipts:{type:Boolean,default:true}},
+ encryptionMode:{type:String,enum:['all_devices','mobile_only'],default:'all_devices'},
+ keyBackup:{encryptedData:{type:String,default:null},salt:{type:String,default:null},iv:{type:String,default:null},updatedAt:Date},
  pushSubscriptions:[{endpoint:String,keys:{p256dh:String,auth:String}}],status:{type:String,enum:['active','deleted'],default:'active'},lastSeenAt:Date
 },{timestamps:true});
 export default mongoose.model('User',schema);

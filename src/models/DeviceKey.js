@@ -15,6 +15,9 @@ const tabSchema = new mongoose.Schema({
 const schema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   deviceId: { type: String, required: true },
+  isPrimary: { type: Boolean, default: false },
+  linkStatus: { type: String, enum: ['approved', 'pending'], default: 'approved' },
+  linkChallenge: { type: String, default: '' },
   identityPublicKey: { type: String, required: true },
   signedPreKeyPublic: { type: String, required: true },
   signedPreKeySignature: { type: String, required: true },
@@ -39,6 +42,11 @@ const schema = new mongoose.Schema({
     default: 'authorized'
   },
   historyAllowedAt: { type: Date, default: null },
+  masterAuthorizations: [{
+    conversation: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
+    expiresAt: { type: Date, required: true }
+  }],
+  profileId: { type: mongoose.Schema.Types.ObjectId, ref: 'DeviceProfile', default: null },
 
   // Active browser tabs tracked on this device
   tabs: { type: [tabSchema], default: [] }

@@ -1,8 +1,8 @@
 import { env } from '../config/env.js';
 import {z} from 'zod';
 const oid=z.string().regex(/^[a-f\d]{24}$/i,'Invalid MongoDB ID');
-export const registerSchema=z.object({body:z.object({username:z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_.]+$/),displayName:z.string().trim().min(1).max(60),password:z.string().min(8).max(128),email:z.string().email().optional(),phone:z.string().trim().min(7).max(20).optional()}),params:z.object({}),query:z.object({})});
-export const loginSchema=z.object({body:z.object({identifier:z.string().min(1),password:z.string().min(1)}),params:z.object({}),query:z.object({})});
+export const registerSchema=z.object({body:z.object({username:z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_.]+$/),displayName:z.string().trim().min(1).max(60),password:z.string().min(8).max(128),email:z.string().email().optional(),phone:z.string().trim().min(7).max(20).optional(),deviceId:z.string().min(1).max(100)}),params:z.object({}),query:z.object({})});
+export const loginSchema=z.object({body:z.object({identifier:z.string().min(1),password:z.string().min(1),deviceId:z.string().min(1).max(100)}),params:z.object({}),query:z.object({})});
 export const profileSchema=z.object({body:z.object({displayName:z.string().trim().min(1).max(60).optional(),bio:z.string().max(300).optional(),discoverableByPhone:z.boolean().optional(),avatarUrl:z.string().url().or(z.literal('')).optional(),statusMessage:z.string().max(140).optional()}).refine(v=>Object.keys(v).length>0),params:z.object({}),query:z.object({})});
 export const changePasswordSchema=z.object({body:z.object({currentPassword:z.string().min(1),newPassword:z.string().min(8).max(128)}),params:z.object({}),query:z.object({})});
 export const searchSchema=z.object({body:z.object({}),params:z.object({}),query:z.object({q:z.string().trim().min(1).max(100)})});

@@ -6,6 +6,7 @@ import { connectDB } from '../src/config/db.js';
 import { connectRedis, closeRedis } from '../src/config/redis.js';
 import { env } from '../src/config/env.js';
 import mongoose from 'mongoose';
+import { createDeviceKeyMaterial } from '../client-examples/e2ee.js';
 
 async function verifySettingsFixes() {
   console.log('Connecting to DB & Redis...');
@@ -13,29 +14,43 @@ async function verifySettingsFixes() {
   await connectDB(env.MONGODB_URI);
 
   const testSuffix = 'v' + Date.now().toString(36);
+  const deviceAId = `settingsA_${testSuffix}`;
+  const deviceBId = `settingsB_${testSuffix}`;
+  const deviceA = await createDeviceKeyMaterial(deviceAId, 5);
+  const deviceB = await createDeviceKeyMaterial(deviceBId, 5);
   const userAData = {
     username: `verif_a_${testSuffix}`,
     displayName: `Verif A ${testSuffix}`,
     password: 'Password123!',
     email: `verif_a_${testSuffix}@example.com`,
-    phone: `+1555${Math.floor(100000 + Math.random() * 900000)}`
+    phone: `+1555${Math.floor(100000 + Math.random() * 900000)}`,
+    deviceId: deviceAId
   };
   const userBData = {
     username: `verif_b_${testSuffix}`,
     displayName: `Verif B ${testSuffix}`,
     password: 'Password123!',
     email: `verif_b_${testSuffix}@example.com`,
-    phone: `+1555${Math.floor(100000 + Math.random() * 900000)}`
+    phone: `+1555${Math.floor(100000 + Math.random() * 900000)}`,
+    deviceId: deviceBId
   };
 
   // Register User A & B
   const regA = await request(app).post('/api/auth/register').send(userAData);
-  const tokenA = regA.body?.data?.token;
+  let tokenA = regA.body?.data?.token;
   const userA = regA.body?.data?.user;
 
   const regB = await request(app).post('/api/auth/register').send(userBData);
   const tokenB = regB.body?.data?.token;
   const userB = regB.body?.data?.user;
+  await request(app).post('/api/e2ee/devices')
+    .set('Authorization', `Bearer ${tokenA}`)
+    .set('X-Device-Id', deviceAId)
+    .send({ ...deviceA.publicRegistration, deviceId: deviceAId });
+  await request(app).post('/api/e2ee/devices')
+    .set('Authorization', `Bearer ${tokenB}`)
+    .set('X-Device-Id', deviceBId)
+    .send({ ...deviceB.publicRegistration, deviceId: deviceBId });
 
   console.log('--- 1. Testing safeUser contains email & phone ---');
   const meA = await request(app).get('/api/users/me').set('Authorization', `Bearer ${tokenA}`);
@@ -73,9 +88,14 @@ async function verifySettingsFixes() {
   if (goodPass.status !== 200) throw new Error('Failed to change password');
 
   // Verify login with new password
-  const loginNew = await request(app).post('/api/auth/login').send({ identifier: userAData.username, password: 'NewPassword999!' });
+  const loginNew = await request(app).post('/api/auth/login').send({ identifier: userAData.username, password: 'NewPassword999!', deviceId: deviceAId });
   console.log('Login with new password status:', loginNew.status);
   if (loginNew.status !== 200) throw new Error('Failed to login with new password');
+  tokenA = loginNew.body?.data?.token;
+  await request(app).post('/api/e2ee/devices')
+    .set('Authorization', `Bearer ${tokenA}`)
+    .set('X-Device-Id', deviceAId)
+    .send({ ...deviceA.publicRegistration, deviceId: deviceAId });
 
   console.log('--- 4. Testing Profile Photo Privacy Enforcement ---');
   // Set User A profile photo to 'nobody'
@@ -105,4 +125,3 @@ verifySettingsFixes().catch(err => {
   console.error(err);
   process.exit(1);
 });
-

@@ -1,3 +1,4 @@
+import User from '../models/User.js';
 import DeviceKey from '../models/DeviceKey.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
@@ -6,6 +7,11 @@ import { ok } from '../utils/respond.js';
 import { assertObjectId } from '../utils/ids.js';
 import { parseDeviceInfo } from '../utils/deviceInfo.js';
 import { revokeSession } from '../services/tokenService.js';
+import { randomUUID } from 'node:crypto';
+import { createPublicKey, verify as verifySignature } from 'node:crypto';
+import SecurityAuditEvent from '../models/SecurityAuditEvent.js';
+import { conversationAccess } from '../services/accessPolicy.js';
+import { getSession } from '../services/tokenService.js';
 
 const clean = (d, includePrekeys = true) => ({
   userId: String(d.user),
@@ -14,13 +20,16 @@ const clean = (d, includePrekeys = true) => ({
   os: d.os || 'Unknown OS',
   browser: d.browser || 'Browser',
   deviceType: d.deviceType || 'browser',
-  sessionId: d.sessionId || '',
   lastSeenAt: d.lastSeenAt,
   createdAt: d.createdAt,
   historyAllowed: d.historyAllowed !== false,
   newMessagesAllowed: d.newMessagesAllowed !== false,
   status: d.status || 'authorized',
   historyAllowedAt: d.historyAllowedAt || null,
+  isPrimary: d.isPrimary === true,
+  linkStatus: d.linkStatus || 'approved',
+  linkChallenge: d.linkStatus === 'pending' ? d.linkChallenge : undefined,
+  profileId: d.profileId ? String(d.profileId) : null,
   identityPublicKey: d.identityPublicKey,
   signedPreKeyPublic: d.signedPreKeyPublic,
   signedPreKeySignature: d.signedPreKeySignature,
@@ -33,14 +42,16 @@ export async function registerDeviceKeys(req, res) {
   if (typeof b.deviceId !== 'string' || b.deviceId.length < 1 || b.deviceId.length > 100) {
     throw new ApiError(400, 'deviceId is required (1-100 characters)');
   }
+  if (b.deviceId !== req.deviceId) throw new ApiError(403, 'Device ID must match the authenticated session');
   for (const k of ['identityPublicKey', 'signedPreKeyPublic', 'signedPreKeySignature']) {
     if (typeof b[k] !== 'string' || b[k].length < 20 || b[k].length > 4096) {
       throw new ApiError(400, `${k} is invalid`);
     }
   }
-  if (!Array.isArray(b.oneTimePreKeys) || b.oneTimePreKeys.length > 500) {
+  if (b.oneTimePreKeys !== undefined && (!Array.isArray(b.oneTimePreKeys) || b.oneTimePreKeys.length > 500)) {
     throw new ApiError(400, 'oneTimePreKeys must be an array with at most 500 entries');
   }
+  b.oneTimePreKeys ||= [];
 
   const seen = new Set();
   for (const p of b.oneTimePreKeys) {
@@ -54,9 +65,11 @@ export async function registerDeviceKeys(req, res) {
   const deviceName = b.deviceName || parsed.deviceName;
   const os = b.os || parsed.os;
   const browser = b.browser || parsed.browser;
-  const deviceType = b.deviceType || parsed.deviceType;
+  const deviceType = parsed.deviceType;
   const ipAddress = req.ip || req.connection?.remoteAddress || '';
   const userAgent = req.headers['user-agent'] || '';
+  const session = await getSession(req.sessionId, req.user.id);
+  const makePrimary = session?.loginMethod === 'phone';
 
   // Check if this device already exists
   let existingDoc = await DeviceKey.findOne({ user: req.user.id, deviceId: b.deviceId });
@@ -65,6 +78,9 @@ export async function registerDeviceKeys(req, res) {
   let newMessagesAllowed = true;
   let status = 'authorized';
   let historyAllowedAt = null;
+  let isPrimary = false;
+  let linkStatus = 'approved';
+  let linkChallenge = '';
 
   if (existingDoc) {
     // Preserve existing permissions and status
@@ -72,6 +88,9 @@ export async function registerDeviceKeys(req, res) {
     newMessagesAllowed = existingDoc.newMessagesAllowed !== false;
     status = existingDoc.status || 'authorized';
     historyAllowedAt = existingDoc.historyAllowedAt;
+    isPrimary = existingDoc.isPrimary === true;
+    linkStatus = existingDoc.linkStatus || 'approved';
+    linkChallenge = existingDoc.linkChallenge || '';
   } else {
     // New device registration: check if this is user's first device
     const priorDevicesCount = await DeviceKey.countDocuments({
@@ -79,14 +98,39 @@ export async function registerDeviceKeys(req, res) {
       deviceId: { $ne: b.deviceId },
       status: { $ne: 'revoked' }
     });
+    const primaryExists = await DeviceKey.exists({ user: req.user.id, isPrimary: true, status: { $ne: 'revoked' } });
+    if (priorDevicesCount > 0 && !primaryExists) {
+      const oldest = await DeviceKey.findOne({ user: req.user.id, status: { $ne: 'revoked' } }).sort({ createdAt: 1 });
+      if (oldest) {
+        oldest.isPrimary = true;
+        oldest.linkStatus = 'approved';
+        await oldest.save();
+        if (oldest.deviceId === b.deviceId) isPrimary = true;
+      }
+    }
 
     if (priorDevicesCount > 0) {
-      // Secondary device logging in: new messages only by default, historical requires explicit permission
       historyAllowed = false;
-      newMessagesAllowed = true;
+      newMessagesAllowed = false;
       status = 'authorized';
       historyAllowedAt = new Date();
+      linkStatus = 'pending';
+      linkChallenge = randomUUID();
+    } else {
+      isPrimary = true;
     }
+  }
+
+  const anotherPrimary = await DeviceKey.exists({ user: req.user.id, isPrimary: true, deviceId: { $ne: b.deviceId }, status: { $ne: 'revoked' } });
+  if (makePrimary) {
+    if (anotherPrimary) await DeviceKey.updateMany({ user: req.user.id, deviceId: { $ne: b.deviceId } }, { $set: { isPrimary: false } });
+    isPrimary = true;
+    linkStatus = 'approved';
+    linkChallenge = '';
+    status = 'authorized';
+    historyAllowed = true;
+    newMessagesAllowed = true;
+    historyAllowedAt = null;
   }
 
   const doc = await DeviceKey.findOneAndUpdate(
@@ -96,7 +140,7 @@ export async function registerDeviceKeys(req, res) {
         identityPublicKey: b.identityPublicKey,
         signedPreKeyPublic: b.signedPreKeyPublic,
         signedPreKeySignature: b.signedPreKeySignature,
-        oneTimePreKeys: b.oneTimePreKeys,
+        ...(b.oneTimePreKeys.length || !existingDoc ? { oneTimePreKeys: b.oneTimePreKeys } : {}),
         lastSeenAt: new Date(),
         deviceName,
         os,
@@ -104,22 +148,92 @@ export async function registerDeviceKeys(req, res) {
         deviceType,
         ipAddress,
         userAgent,
-        sessionId: req.sessionId || '',
         historyAllowed,
         newMessagesAllowed,
         status,
-        historyAllowedAt
+        historyAllowedAt,
+        isPrimary,
+        linkStatus,
+        linkChallenge,
+        sessionId: req.sessionId || ''
       }
     },
     { upsert: true, new: true, runValidators: true }
   );
+  await SecurityAuditEvent.create({
+    user: req.user.id,
+    actorDeviceId: req.deviceId,
+    action: linkStatus === 'pending' ? 'device_link_requested' : 'device_enrolled',
+    targetType: 'device',
+    targetId: doc.deviceId
+  });
 
   ok(res, clean(doc), 'Public device keys registered');
 }
 
+export async function authorizeDeviceLink(req, res) {
+  if (!req.device?.isPrimary || req.device.linkStatus !== 'approved') {
+    throw new ApiError(403, 'Only the approved primary device can authorize a linked device');
+  }
+  const target = await DeviceKey.findOne({
+    user: req.user.id,
+    deviceId: String(req.params.deviceId || ''),
+    status: { $ne: 'revoked' },
+    linkStatus: 'pending'
+  });
+  if (!target) throw new ApiError(404, 'Pending device link not found');
+  const signature = req.body?.signature;
+  if (typeof signature !== 'string' || signature.length < 80 || signature.length > 200) {
+    throw new ApiError(400, 'Device authorization signature is invalid');
+  }
+  const message = [
+    'orbit-device-link-v1',
+    String(req.user.id),
+    target.deviceId,
+    target.identityPublicKey,
+    target.linkChallenge
+  ].join('\n');
+  let valid = false;
+  try {
+    const jwk = JSON.parse(Buffer.from(req.device.identityPublicKey, 'base64').toString('utf8'));
+    const key = createPublicKey({ key: jwk, format: 'jwk' });
+    valid = verifySignature('sha256', Buffer.from(message), { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64'));
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw new ApiError(403, 'Primary-device signature could not be verified');
+  target.linkStatus = 'approved';
+  target.linkChallenge = '';
+  target.newMessagesAllowed = true;
+  target.status = 'authorized';
+  await target.save();
+  await SecurityAuditEvent.create({
+    user: req.user.id,
+    actorDeviceId: req.deviceId,
+    action: 'device_link_approved',
+    targetType: 'device',
+    targetId: target.deviceId
+  });
+  ok(res, clean(target), 'Device link approved');
+}
+
+export async function renameDevice(req, res) {
+  const device = await DeviceKey.findOne({ user: req.user.id, deviceId: String(req.params.deviceId || ''), status: { $ne: 'revoked' } });
+  if (!device) throw new ApiError(404, 'Device not found');
+  if (device.deviceId !== req.deviceId && !req.device?.isPrimary) {
+    throw new ApiError(403, 'Only the primary device can rename another device');
+  }
+  const name = String(req.body?.deviceName || '').trim();
+  if (!name || name.length > 80) throw new ApiError(400, 'Device name must be 1-80 characters');
+  device.deviceName = name;
+  await device.save();
+  await SecurityAuditEvent.create({ user: req.user.id, actorDeviceId: req.deviceId, action: 'device_renamed', targetType: 'device', targetId: device.deviceId });
+  ok(res, clean(device), 'Device renamed');
+}
+
 export async function listMyDevices(req, res) {
   const ds = await DeviceKey.find({ user: req.user.id })
-    .select('deviceId deviceName os browser deviceType sessionId lastSeenAt createdAt historyAllowed newMessagesAllowed status historyAllowedAt identityPublicKey signedPreKeyPublic signedPreKeySignature oneTimePreKeys.length tabs')
+    .select('deviceId deviceName os browser deviceType sessionId lastSeenAt createdAt isPrimary linkStatus historyAllowed newMessagesAllowed status historyAllowedAt identityPublicKey signedPreKeyPublic signedPreKeySignature oneTimePreKeys.length tabs')
     .sort({ lastSeenAt: -1 });
 
   const currentDeviceId = req.headers['x-device-id'] || '';
@@ -133,9 +247,13 @@ export async function listMyDevices(req, res) {
 }
 
 export async function updateDevicePermissions(req, res) {
+  if (!req.device?.isPrimary) throw new ApiError(403, 'Primary-device approval is required');
   const deviceId = String(req.params.deviceId || '');
   const doc = await DeviceKey.findOne({ user: req.user.id, deviceId });
   if (!doc) throw new ApiError(404, 'Device not found');
+  if (doc.isPrimary && (req.body.policy === 'block' || req.body.newMessagesAllowed === false || req.body.historyAllowed === false)) {
+    throw new ApiError(400, 'The primary device cannot revoke its own access');
+  }
 
   const policy = req.body.policy;
   if (policy === 'allow_all') {
@@ -172,6 +290,7 @@ export async function updateDevicePermissions(req, res) {
   }
 
   await doc.save();
+  await SecurityAuditEvent.create({ user: req.user.id, actorDeviceId: req.deviceId, action: 'device_permissions_updated', targetType: 'device', targetId: doc.deviceId });
 
   // Notify active sockets via Socket.IO
   const io = req.app.get('io');
@@ -188,14 +307,17 @@ export async function updateDevicePermissions(req, res) {
 }
 
 export async function revokeDevice(req, res) {
+  if (!req.device?.isPrimary) throw new ApiError(403, 'Primary-device approval is required');
   const deviceId = String(req.params.deviceId || '');
   const doc = await DeviceKey.findOne({ user: req.user.id, deviceId });
   if (!doc) throw new ApiError(404, 'Device not found');
+  if (doc.isPrimary) throw new ApiError(400, 'The primary device cannot revoke itself');
 
   doc.status = 'revoked';
   doc.historyAllowed = false;
   doc.newMessagesAllowed = false;
   await doc.save();
+  await SecurityAuditEvent.create({ user: req.user.id, actorDeviceId: req.deviceId, action: 'device_revoked', targetType: 'device', targetId: doc.deviceId });
 
   // Invalidate session in Redis/memory
   if (doc.sessionId) {
@@ -224,9 +346,11 @@ export async function revokeDevice(req, res) {
 }
 
 export async function deleteMyDevice(req, res) {
+  if (!req.device?.isPrimary) throw new ApiError(403, 'Primary-device approval is required');
   const deviceId = String(req.params.deviceId || '');
   const doc = await DeviceKey.findOne({ user: req.user.id, deviceId });
   if (!doc) throw new ApiError(404, 'Device not found');
+  if (doc.isPrimary) throw new ApiError(400, 'The primary device cannot be deleted; use the supported replacement workflow');
 
   if (doc.sessionId) {
     await revokeSession(doc.sessionId);
@@ -253,6 +377,7 @@ export async function syncTab(req, res) {
   const deviceId = String(b.deviceId || req.headers['x-device-id'] || '');
   const tabId = String(b.tabId || '');
   if (!deviceId || !tabId) throw new ApiError(400, 'deviceId and tabId are required');
+  if (deviceId !== req.deviceId) throw new ApiError(403, 'Tabs can only be managed by their enrolled device');
 
   const doc = await DeviceKey.findOne({ user: req.user.id, deviceId });
   if (!doc) throw new ApiError(404, 'Device not found');
@@ -281,6 +406,7 @@ export async function updateTabStatus(req, res) {
   const deviceId = String(req.params.deviceId || '');
   const tabId = String(req.params.tabId || '');
   const status = req.body.status;
+  if (deviceId !== req.deviceId) throw new ApiError(403, 'Tabs can only be managed by their enrolled device');
   if (!['active', 'restricted', 'closed'].includes(status)) {
     throw new ApiError(400, 'Invalid tab status');
   }
@@ -302,40 +428,48 @@ export async function authorizeHistoryEnvelopes(req, res) {
   const b = req.body || {};
   const targetDeviceId = String(b.targetDeviceId || '');
   const envelopes = Array.isArray(b.envelopes) ? b.envelopes : [];
+  const complete = b.complete === true;
 
   if (!targetDeviceId) throw new ApiError(400, 'targetDeviceId is required');
-  if (!envelopes.length) throw new ApiError(400, 'No envelopes provided');
+  if (!envelopes.length && !complete) throw new ApiError(400, 'No envelopes provided');
 
   // Verify target device belongs to current user
   const targetDevice = await DeviceKey.findOne({ user: req.user.id, deviceId: targetDeviceId });
   if (!targetDevice) throw new ApiError(404, 'Target device not found for your account');
-  if (targetDevice.status === 'revoked') throw new ApiError(400, 'Cannot authorize revoked device');
+  if (targetDevice.status === 'revoked' || targetDevice.linkStatus !== 'approved') throw new ApiError(400, 'Cannot authorize a pending or revoked device');
 
-  // Authorize caller device: caller must have historyAllowed = true or be owner
-  const callerDeviceId = req.headers['x-device-id'];
-  if (callerDeviceId) {
-    const callerDevice = await DeviceKey.findOne({ user: req.user.id, deviceId: callerDeviceId });
-    if (callerDevice && callerDevice.status === 'revoked') {
-      throw new ApiError(403, 'Your device session is revoked');
-    }
+  if (!req.device?.isPrimary || req.device.historyAllowed === false) {
+    throw new ApiError(403, 'Only the authorized primary device can approve message history');
   }
 
   let updatedCount = 0;
   for (const item of envelopes) {
     if (!item?.messageId || !item?.envelope) continue;
     assertObjectId(item.messageId, 'message ID');
-    const env = item.envelope;
-    if (typeof env.ephemeralPublicKey !== 'string' || typeof env.salt !== 'string' || typeof env.keyNonce !== 'string' || typeof env.encryptedKey !== 'string') {
+    const envelope = item.envelope;
+    if (typeof envelope.ephemeralPublicKey !== 'string' || typeof envelope.salt !== 'string' || typeof envelope.keyNonce !== 'string' || typeof envelope.encryptedKey !== 'string') {
       continue;
     }
+    const message = await Message.findOne({ _id: item.messageId, deletedForEveryone: false }).select('conversation');
+    const conversation = message && await Conversation.findOne({ _id: message.conversation, members: req.user.id });
+    if (!message || !conversation) {
+      throw new ApiError(404, 'Message not found');
+    }
+    const historyAccess = await conversationAccess(
+      conversation,
+      req.user.id,
+      { ...targetDevice.toObject(), historyAllowed: true },
+      'history'
+    );
+    if (!historyAccess.allowed) throw new ApiError(403, 'The target device is not permitted to receive keys for this conversation');
 
     const newEnvelope = {
       recipientDeviceId: targetDeviceId,
-      oneTimePreKeyId: env.oneTimePreKeyId || null,
-      ephemeralPublicKey: env.ephemeralPublicKey,
-      salt: env.salt,
-      keyNonce: env.keyNonce,
-      encryptedKey: env.encryptedKey
+      oneTimePreKeyId: envelope.oneTimePreKeyId || null,
+      ephemeralPublicKey: envelope.ephemeralPublicKey,
+      salt: envelope.salt,
+      keyNonce: envelope.keyNonce,
+      encryptedKey: envelope.encryptedKey
     };
 
     // Update message: remove existing envelope for targetDeviceId if any, then add new one
@@ -354,33 +488,37 @@ export async function authorizeHistoryEnvelopes(req, res) {
     if (updated.modifiedCount > 0) updatedCount++;
   }
 
-  // Update target device to full history access
-  targetDevice.historyAllowed = true;
-  targetDevice.historyAllowedAt = null;
-  targetDevice.status = 'authorized';
-  await targetDevice.save();
+  if (complete) {
+    targetDevice.historyAllowed = true;
+    targetDevice.historyAllowedAt = null;
+    targetDevice.status = 'authorized';
+    await targetDevice.save();
+  }
 
   // Notify user's sockets
   const io = req.app.get('io');
   if (io) {
     io.to(`user:${req.user.id}`).emit('device:permission_updated', {
       deviceId: targetDeviceId,
-      historyAllowed: true,
+      historyAllowed: targetDevice.historyAllowed,
       newMessagesAllowed: targetDevice.newMessagesAllowed,
       status: 'authorized'
     });
   }
 
-  ok(res, { targetDeviceId, updatedCount, historyAllowed: true }, 'Historical encryption keys authorized');
+  ok(res, { targetDeviceId, updatedCount, historyAllowed: targetDevice.historyAllowed }, complete ? 'Historical encryption keys authorized' : 'Historical encryption keys transferred');
 }
 
 export async function getUserKeyBundles(req, res) {
   assertObjectId(req.params.userId, 'user ID');
   const other = String(req.params.userId);
 
-  if (other !== String(req.user.id)) {
-    const mutual = await Conversation.exists({ members: { $all: [req.user.id, other] } });
-    if (!mutual) throw new ApiError(404, 'User or shared conversation not found');
+  const conversationId = String(req.query.conversationId || '');
+  assertObjectId(conversationId, 'conversation ID');
+  const conversation = await Conversation.findOne({ _id: conversationId, members: { $all: [req.user.id, other] } });
+  if (!conversation) throw new ApiError(404, 'User or shared conversation not found');
+  if (!(await conversationAccess(conversation, req.user.id, req.device, 'new')).allowed) {
+    throw new ApiError(403, 'This device is not authorized to request conversation keys');
   }
 
   // Filter devices: only include devices that are authorized to receive new messages and not revoked/blocked
@@ -394,6 +532,7 @@ export async function getUserKeyBundles(req, res) {
 
   const bundles = [];
   for (const d of devices) {
+    if (d.linkStatus !== 'approved' || !(await conversationAccess(conversation, other, d, 'new')).allowed) continue;
     let preKey = null;
     if (d.oneTimePreKeys?.length) {
       preKey = d.oneTimePreKeys[0];
@@ -422,6 +561,7 @@ export async function replenishOneTimePreKeys(req, res) {
     throw new ApiError(400, 'Provide 1-500 one-time prekeys');
   }
   const deviceId = String(b.deviceId || '');
+  if (deviceId !== req.deviceId) throw new ApiError(403, 'Prekeys can only be replenished by their enrolled device');
   const d = await DeviceKey.findOne({ user: req.user.id, deviceId });
   if (!d) throw new ApiError(404, 'Device keys not found');
   const existing = new Set(d.oneTimePreKeys.map(p => p.keyId));
@@ -434,4 +574,55 @@ export async function replenishOneTimePreKeys(req, res) {
   d.oneTimePreKeys.push(...b.oneTimePreKeys);
   await d.save();
   ok(res, { remaining: d.oneTimePreKeys.length }, 'One-time prekeys replenished');
+}
+
+
+export async function getKeyBackup(req, res) {
+  const user = await User.findById(req.user.id).select('keyBackup encryptionMode');
+  ok(res, {
+    keyBackup: user?.keyBackup || null,
+    encryptionMode: user?.encryptionMode || 'all_devices'
+  }, 'Key backup retrieved');
+}
+
+export async function saveKeyBackup(req, res) {
+  const { encryptedData, salt, iv, encryptionMode } = req.body || {};
+  if (!encryptedData || !salt || !iv) {
+    throw new ApiError(400, 'encryptedData, salt, and iv are required for key backup');
+  }
+  const update = {
+    'keyBackup.encryptedData': encryptedData,
+    'keyBackup.salt': salt,
+    'keyBackup.iv': iv,
+    'keyBackup.updatedAt': new Date()
+  };
+  if (encryptionMode && ['all_devices', 'mobile_only'].includes(encryptionMode)) {
+    update.encryptionMode = encryptionMode;
+  }
+  const user = await User.findByIdAndUpdate(req.user.id, { $set: update }, { new: true });
+  await SecurityAuditEvent.create({
+    user: req.user.id,
+    actorDeviceId: req.deviceId,
+    action: 'key_backup_saved',
+    targetType: 'account',
+    targetId: req.user.id
+  });
+  ok(res, { hasKeyBackup: true, encryptionMode: user?.encryptionMode || 'all_devices' }, 'Key backup saved successfully');
+}
+
+export async function updateEncryptionMode(req, res) {
+  const { mode } = req.body || {};
+  if (!['all_devices', 'mobile_only'].includes(mode)) {
+    throw new ApiError(400, 'Mode must be all_devices or mobile_only');
+  }
+  const user = await User.findByIdAndUpdate(req.user.id, { $set: { encryptionMode: mode } }, { new: true });
+  await SecurityAuditEvent.create({
+    user: req.user.id,
+    actorDeviceId: req.deviceId,
+    action: 'encryption_mode_updated',
+    targetType: 'account',
+    targetId: req.user.id,
+    details: { mode }
+  });
+  ok(res, { encryptionMode: user?.encryptionMode || 'all_devices' }, 'Encryption mode updated');
 }

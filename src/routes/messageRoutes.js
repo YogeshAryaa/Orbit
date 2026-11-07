@@ -1,2 +1,11 @@
 import {Router} from 'express';import {sendMessage,editMessage,deleteMessage,reactMessage,readConversation} from '../controllers/messageController.js';import {setMessagePin} from '../controllers/conversationController.js';import {requireAuth} from '../middleware/auth.js';import {validate} from '../middleware/validate.js';import {messageSchema,updateMessageSchema} from '../validators/schemas.js';
-const r=Router();r.use(requireAuth);r.post('/',validate(messageSchema),sendMessage);r.patch('/:id',validate(updateMessageSchema),editMessage);r.delete('/:id',deleteMessage);r.post('/:id/reactions',reactMessage);r.post('/read/:id',readConversation);r.patch('/:id/pin',setMessagePin);export default r;
+import {asyncHandler} from '../utils/asyncHandler.js';
+const r=Router();
+r.use(requireAuth);
+r.post('/',validate(messageSchema),asyncHandler(sendMessage));
+r.patch('/:id',validate(updateMessageSchema),asyncHandler(editMessage));
+r.delete('/:id',asyncHandler(deleteMessage));
+r.post('/:id/reactions',asyncHandler(reactMessage));
+r.post('/read/:id',asyncHandler(readConversation));
+r.patch('/:id/pin',asyncHandler(setMessagePin));
+export default r;

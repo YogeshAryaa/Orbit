@@ -27,5 +27,6 @@ async function shutdown(signal) {
  io.close(); server.close(async()=>{ await closeRedis(); process.exit(0); });
  setTimeout(()=>process.exit(1),10000).unref();
 }
+process.on('unhandledRejection',e=>console.error(JSON.stringify({level:'error',event:'unhandled_rejection',message:String(e?.message||e)})));
 process.on('SIGTERM',()=>shutdown('SIGTERM'));
 process.on('SIGINT',()=>shutdown('SIGINT'));

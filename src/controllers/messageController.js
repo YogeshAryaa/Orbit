@@ -1,19 +1,22 @@
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import User from '../models/User.js';
-import DeviceKey from '../models/DeviceKey.js';
 import { ApiError } from '../utils/ApiError.js';
 import { ok } from '../utils/respond.js';
 import { assertObjectId } from '../utils/ids.js';
 import { notifyUser } from '../services/pushService.js';
 import { env } from '../config/env.js';
+import { conversationAccess, emitToAuthorizedConversation } from '../services/accessPolicy.js';
 
-async function accessibleMessage(id, userId) {
+async function accessibleMessage(id, userId, device) {
   assertObjectId(id, 'message ID');
   const m = await Message.findById(id);
   if (!m) throw new ApiError(404, 'Message not found');
   const c = await Conversation.findOne({ _id: m.conversation, members: userId });
   if (!c) throw new ApiError(404, 'Message not found');
+  if (!(await conversationAccess(c, userId, device, 'new')).allowed) {
+    throw new ApiError(403, 'This device is not authorized to access message content');
+  }
   return { m, c };
 }
 
@@ -22,16 +25,8 @@ export async function sendMessage(req, res) {
   const c = await Conversation.findOne({ _id: input.conversationId, members: req.user.id });
   if (!c) throw new ApiError(404, 'Conversation not found');
 
-  // Enforce device permissions on sender
-  const deviceId = req.headers['x-device-id'];
-  if (deviceId) {
-    const dev = req.device || await DeviceKey.findOne({ user: req.user.id, deviceId });
-    if (dev) {
-      if (dev.status === 'revoked') throw new ApiError(401, 'Device access has been revoked');
-      if (dev.status === 'fully_blocked' || dev.newMessagesAllowed === false) {
-        throw new ApiError(403, 'Message access is blocked for this device');
-      }
-    }
+  if (!(await conversationAccess(c, req.user.id, req.device, 'new')).allowed) {
+    throw new ApiError(403, 'This device is not authorized to send messages in this conversation');
   }
 
   const recipientUsers = await User.find({ _id: { $in: c.members }, blockedUsers: req.user.id }).select('_id');
@@ -78,19 +73,9 @@ export async function sendMessage(req, res) {
 
   const populated = await m.populate('sender', 'publicId username displayName avatarUrl');
 
-  // Deliver only to sockets whose devices permit new messages
   const io = req.app.get('io');
   if (io) {
-    const sockets = await io.in(c.id).fetchSockets();
-    for (const s of sockets) {
-      if (s.deviceId) {
-        const dev = await DeviceKey.findOne({ user: s.userId, deviceId: s.deviceId });
-        if (dev && (dev.newMessagesAllowed === false || dev.status === 'fully_blocked' || dev.status === 'revoked')) {
-          continue;
-        }
-      }
-      s.emit('message:new', { conversationId: c.id, message: populated });
-    }
+    await emitToAuthorizedConversation(io, c, 'message:new', { conversationId: c.id, message: populated });
   }
 
   // Push notifications for offline members
@@ -110,7 +95,7 @@ export async function sendMessage(req, res) {
 }
 
 export async function editMessage(req, res) {
-  const { m } = await accessibleMessage(req.params.id, req.user.id);
+  const { m, c } = await accessibleMessage(req.params.id, req.user.id, req.device);
   if (String(m.sender) !== String(req.user.id)) throw new ApiError(403, 'Only sender can edit');
   if (m.deletedForEveryone) throw new ApiError(400, 'Message was deleted');
   if (Date.now() - m.createdAt.getTime() > 15 * 60 * 1000) throw new ApiError(403, 'Edit window expired');
@@ -126,12 +111,12 @@ export async function editMessage(req, res) {
   }
   m.editedAt = new Date();
   await m.save();
-  req.app.get('io')?.to(m.conversation.toString()).emit('message:updated', m);
+  if (req.app.get('io')) await emitToAuthorizedConversation(req.app.get('io'), c, 'message:updated', m);
   ok(res, m, 'Message edited');
 }
 
 export async function deleteMessage(req, res) {
-  const { m } = await accessibleMessage(req.params.id, req.user.id);
+  const { m, c } = await accessibleMessage(req.params.id, req.user.id, req.device);
   if (req.body.forEveryone === true) {
     if (String(m.sender) !== String(req.user.id)) throw new ApiError(403, 'Only sender can delete for everyone');
     m.deletedForEveryone = true;
@@ -142,7 +127,7 @@ export async function deleteMessage(req, res) {
     m.deletedFor.addToSet(req.user.id);
   }
   await m.save();
-  req.app.get('io')?.to(m.conversation.toString()).emit('message:deleted', {
+  if (req.app.get('io')) await emitToAuthorizedConversation(req.app.get('io'), c, 'message:deleted', {
     messageId: m.id,
     forEveryone: m.deletedForEveryone,
     userId: req.user.id
@@ -151,13 +136,13 @@ export async function deleteMessage(req, res) {
 }
 
 export async function reactMessage(req, res) {
-  const { m } = await accessibleMessage(req.params.id, req.user.id);
+  const { m, c } = await accessibleMessage(req.params.id, req.user.id, req.device);
   const emoji = String(req.body.emoji || '').trim();
   if (!emoji || emoji.length > 32) throw new ApiError(400, 'Valid emoji required');
   m.reactions = m.reactions.filter(r => String(r.user) !== String(req.user.id) || r.emoji !== emoji);
   m.reactions.push({ user: req.user.id, emoji });
   await m.save();
-  req.app.get('io')?.to(m.conversation.toString()).emit('message:reaction', { messageId: m.id, reactions: m.reactions });
+  if (req.app.get('io')) await emitToAuthorizedConversation(req.app.get('io'), c, 'message:reaction', { messageId: m.id, reactions: m.reactions });
   ok(res, m, 'Reaction saved');
 }
 
@@ -165,13 +150,16 @@ export async function readConversation(req, res) {
   assertObjectId(req.params.id, 'conversation ID');
   const c = await Conversation.findOne({ _id: req.params.id, members: req.user.id });
   if (!c) throw new ApiError(404, 'Conversation not found');
+  if (!(await conversationAccess(c, req.user.id, req.device, 'new')).allowed) {
+    throw new ApiError(403, 'This device is not authorized to access this conversation');
+  }
   const userDoc = await User.findById(req.user.id).select('privacy');
   if (userDoc?.privacy?.readReceipts !== false) {
     await Message.updateMany(
       { conversation: c._id, sender: { $ne: req.user.id }, readBy: { $ne: req.user.id } },
       { $addToSet: { readBy: req.user.id, deliveredTo: req.user.id } }
     );
-    req.app.get('io')?.to(c.id).emit('receipt:read', { conversationId: c.id, userId: req.user.id });
+    if (req.app.get('io')) await emitToAuthorizedConversation(req.app.get('io'), c, 'receipt:read', { conversationId: c.id, userId: req.user.id });
   } else {
     await Message.updateMany(
       { conversation: c._id, sender: { $ne: req.user.id }, deliveredTo: { $ne: req.user.id } },
@@ -189,15 +177,8 @@ export async function searchMessages(req, res) {
   const c = await Conversation.findOne({ _id: req.params.id, members: req.user.id });
   if (!c) throw new ApiError(404, 'Conversation not found');
 
-  const deviceId = req.headers['x-device-id'];
-  if (deviceId) {
-    const dev = req.device || await DeviceKey.findOne({ user: req.user.id, deviceId });
-    if (dev) {
-      if (dev.status === 'revoked') throw new ApiError(401, 'Device access has been revoked');
-      if (dev.status === 'fully_blocked' || (!dev.newMessagesAllowed && !dev.historyAllowed)) {
-        return ok(res, [], 'Message access is blocked for this device');
-      }
-    }
+  if (!(await conversationAccess(c, req.user.id, req.device, 'new')).allowed) {
+    throw new ApiError(403, 'This device is not authorized to search this conversation');
   }
 
   const q = String(req.query.q || '').trim();

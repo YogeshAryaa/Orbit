@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import {
   registerDeviceKeys,
+  authorizeDeviceLink,
+  renameDevice,
   listMyDevices,
   deleteMyDevice,
   updateDevicePermissions,
@@ -10,21 +12,44 @@ import {
   updateTabStatus,
   authorizeHistoryEnvelopes,
   getUserKeyBundles,
-  replenishOneTimePreKeys
+  replenishOneTimePreKeys,
+  getKeyBackup,
+  saveKeyBackup,
+  updateEncryptionMode
 } from '../controllers/e2eeController.js';
+import {
+  assignProfile,
+  createProfile,
+  deleteProfile,
+  listProfiles,
+  listSecurityActivity,
+  updateProfile
+} from '../controllers/privacyController.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const r = Router();
 r.use(requireAuth);
 
-r.post('/devices', registerDeviceKeys);
-r.get('/devices', listMyDevices);
-r.patch('/devices/:deviceId/permissions', updateDevicePermissions);
-r.post('/devices/:deviceId/revoke', revokeDevice);
-r.delete('/devices/:deviceId', deleteMyDevice);
-r.post('/devices/tabs/sync', syncTab);
-r.patch('/devices/:deviceId/tabs/:tabId', updateTabStatus);
-r.post('/devices/authorize-history', authorizeHistoryEnvelopes);
-r.post('/devices/prekeys', replenishOneTimePreKeys);
-r.get('/users/:userId/bundles', getUserKeyBundles);
+r.post('/devices', asyncHandler(registerDeviceKeys));
+r.post('/devices/:deviceId/authorize-link', asyncHandler(authorizeDeviceLink));
+r.patch('/devices/:deviceId', asyncHandler(renameDevice));
+r.get('/devices', asyncHandler(listMyDevices));
+r.patch('/devices/:deviceId/permissions', asyncHandler(updateDevicePermissions));
+r.post('/devices/:deviceId/revoke', asyncHandler(revokeDevice));
+r.delete('/devices/:deviceId', asyncHandler(deleteMyDevice));
+r.post('/devices/tabs/sync', asyncHandler(syncTab));
+r.patch('/devices/:deviceId/tabs/:tabId', asyncHandler(updateTabStatus));
+r.post('/devices/authorize-history', asyncHandler(authorizeHistoryEnvelopes));
+r.post('/devices/prekeys', asyncHandler(replenishOneTimePreKeys));
+r.get('/users/:userId/bundles', asyncHandler(getUserKeyBundles));
+r.get('/key-backup', asyncHandler(getKeyBackup));
+r.post('/key-backup', asyncHandler(saveKeyBackup));
+r.patch('/encryption-mode', asyncHandler(updateEncryptionMode));
+r.get('/profiles', asyncHandler(listProfiles));
+r.post('/profiles', asyncHandler(createProfile));
+r.patch('/profiles/:profileId', asyncHandler(updateProfile));
+r.delete('/profiles/:profileId', asyncHandler(deleteProfile));
+r.patch('/devices/:deviceId/profile', asyncHandler(assignProfile));
+r.get('/security-activity', asyncHandler(listSecurityActivity));
 
 export default r;

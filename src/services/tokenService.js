@@ -12,14 +12,14 @@ function expiresInSeconds(value) {
   if (!m) return 7 * 24 * 3600;
   return Number(m[1]) * ({ s: 1, m: 60, h: 3600, d: 86400 }[m[2]]);
 }
-export async function createSessionToken(userId) {
+export async function createSessionToken(userId, deviceId, options = {}) {
   const sid = randomUUID();
   const ttl = expiresInSeconds(env.JWT_EXPIRES_IN);
-  const session = JSON.stringify({ userId: String(userId), createdAt: Date.now() });
+  const session = JSON.stringify({ userId: String(userId), deviceId: deviceId || '', loginMethod: options.loginMethod || 'other', createdAt: Date.now() });
   const redis = getRedis();
   if (redis) await redis.set(key(sid), session, { EX: ttl });
   else memorySessions.set(sid, { value: session, expiresAt: Date.now() + ttl * 1000 });
-  const token = jwt.sign({ sub: String(userId), sid }, env.JWT_SECRET, { expiresIn: ttl });
+  const token = jwt.sign({ sub: String(userId), sid, deviceId: deviceId || '' }, env.JWT_SECRET, { expiresIn: ttl });
   return { token, expiresIn: ttl };
 }
 export async function isSessionActive(sid, userId) {
@@ -34,6 +34,24 @@ export async function isSessionActive(sid, userId) {
   }
   if (!raw) return false;
   try { return JSON.parse(raw).userId === String(userId); } catch { return false; }
+}
+export async function getSession(sid, userId) {
+  if (!sid) return null;
+  const redis = getRedis();
+  let raw;
+  if (redis) raw = await redis.get(key(sid));
+  else {
+    const record = memorySessions.get(sid);
+    if (record && record.expiresAt > Date.now()) raw = record.value;
+    else memorySessions.delete(sid);
+  }
+  if (!raw) return null;
+  try {
+    const session = JSON.parse(raw);
+    return session.userId === String(userId) ? session : null;
+  } catch {
+    return null;
+  }
 }
 export async function revokeSession(sid) {
   if (!sid) return;
