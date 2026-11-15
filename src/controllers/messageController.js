@@ -46,6 +46,8 @@ export async function sendMessage(req, res) {
     forwardedFrom = f._id;
   }
 
+  const mentions = (input.mentions || []).filter(id => c.members.some(m => String(m) === String(id)));
+
   if (String(env.E2EE_REQUIRED || 'true').toLowerCase() !== 'false' && !input.encryptedPayload) {
     throw new ApiError(400, 'End-to-end encrypted payload is required');
   }
@@ -60,7 +62,8 @@ export async function sendMessage(req, res) {
     text: String(env.E2EE_REQUIRED).toLowerCase() === 'false' ? (input.text || '') : '',
     attachments: input.attachments || [],
     replyTo,
-    forwardedFrom
+    forwardedFrom,
+    mentions
   };
 
   if (c.disappearingAfterSeconds > 0) {
@@ -85,6 +88,19 @@ export async function sendMessage(req, res) {
         title: populated.sender?.displayName || populated.sender?.username || 'Orbit',
         body: 'New encrypted message received',
         type: 'message',
+        conversationId: c.id,
+        url: `/chat?open=${c.id}`
+      }).catch(() => {});
+    }
+  }
+
+  // Mention notifications
+  for (const mentionedId of mentions) {
+    if (String(mentionedId) !== String(req.user.id)) {
+      notifyUser(mentionedId, {
+        title: `${populated.sender?.displayName || populated.sender?.username || 'Someone'} mentioned you`,
+        body: 'You were mentioned in a message',
+        type: 'mention',
         conversationId: c.id,
         url: `/chat?open=${c.id}`
       }).catch(() => {});

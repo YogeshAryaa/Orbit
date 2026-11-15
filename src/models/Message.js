@@ -7,7 +7,7 @@ const schema=new mongoose.Schema({
  encryptedPayload:{type:encryptedPayload,default:null},text:{type:String,select:false,default:''},attachments:[attachment],replyTo:{type:mongoose.Schema.Types.ObjectId,ref:'Message',default:null},
  forwardedFrom:{type:mongoose.Schema.Types.ObjectId,ref:'Message',default:null},editedAt:Date,deletedFor:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],
  deletedForEveryone:{type:Boolean,default:false},reactions:[{user:{type:mongoose.Schema.Types.ObjectId,ref:'User'},emoji:{type:String,maxlength:32}}],
- pinnedBy:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],deliveredTo:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],readBy:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],
+ pinnedBy:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],mentions:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],deliveredTo:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],readBy:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],
  expiresAt:{type:Date,index:{expireAfterSeconds:0}}
 },{timestamps:true});
 schema.index({conversation:1,createdAt:-1});
