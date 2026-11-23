@@ -1,5 +1,3 @@
-import dns from 'node:dns';
-dns.setServers(['8.8.8.8', '8.8.4.4']);
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';

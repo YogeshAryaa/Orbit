@@ -59,7 +59,8 @@ export async function sendMessage(req, res) {
     conversation: c._id,
     sender: req.user.id,
     encryptedPayload: input.encryptedPayload || null,
-    text: String(env.E2EE_REQUIRED).toLowerCase() === 'false' ? (input.text || '') : '',
+    // Never persist a client-side plaintext duplicate when E2EE is enabled.
+    text: String(env.E2EE_REQUIRED || 'true').toLowerCase() === 'false' ? input.text || '' : '',
     attachments: input.attachments || [],
     replyTo,
     forwardedFrom,
@@ -119,6 +120,7 @@ export async function editMessage(req, res) {
   if (String(env.E2EE_REQUIRED || 'true').toLowerCase() !== 'false') {
     if (!req.body.encryptedPayload) throw new ApiError(400, 'Encrypted payload is required for edits');
     m.encryptedPayload = req.body.encryptedPayload;
+    m.text = '';
   } else {
     if (typeof req.body.text !== 'string' || req.body.text.length > 10000) {
       throw new ApiError(400, 'text is required and must be <=10000 characters');

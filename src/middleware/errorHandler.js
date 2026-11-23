@@ -11,6 +11,6 @@ export function errorHandler(err,req,res,next){
   else status=500;
  }
  const message=status>=500&&process.env.NODE_ENV==='production'?'Internal server error':(err.message||'Internal server error');
- if(status>=500) console.error(JSON.stringify({level:'error',event:'request_failed',path:req.path,method:req.method,message:err.message}));
+ if(status>=500) console.error(JSON.stringify({level:'error',event:'request_failed',path:req.path,method:req.method,errorName:err.name,code:err.code}));
  res.status(status).json({success:false,data:null,message,...(err.details?{errors:err.details}:{})});
 }

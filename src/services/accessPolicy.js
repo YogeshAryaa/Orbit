@@ -1,8 +1,18 @@
 import DeviceProfile from '../models/DeviceProfile.js';
 import DeviceKey from '../models/DeviceKey.js';
 import User from '../models/User.js';
+import mongoose from 'mongoose';
 
 export async function conversationAccess(conversation, userId, device, purpose = 'history') {
+  const user = mongoose.isValidObjectId(userId) ? await User.findById(userId).select('encryptionMode privacy accountKeys') : null;
+  if (user?.accountKeys?.identityPublicKey) return { allowed: true, mode: 'account_keys' };
+  const isStrictPrivacy = user?.privacy?.strictDevicePrivacy === true;
+
+  if (!isStrictPrivacy) {
+    // When strict privacy is OFF, allow all authenticated devices and tabs freely
+    return { allowed: true, mode: 'open' };
+  }
+
   if (!device || device.status !== 'authorized' || device.linkStatus !== 'approved') {
     return { allowed: false, mode: 'header_only' };
   }
@@ -12,8 +22,21 @@ export async function conversationAccess(conversation, userId, device, purpose =
     return { allowed: false, mode: 'header_only' };
   }
 
+  const policy = conversation?.memberAccessPolicies?.find(item => String(item.user) === String(userId));
+  if (policy?.mode === 'selected_devices' && !policy.selectedDeviceIds?.includes(device.deviceId)) {
+    return { allowed: false, mode: 'selected_devices' };
+  }
+  if (policy?.mode === 'master_authorization' && !device.isPrimary &&
+      !(device.masterAuthorizations || []).some(entry =>
+        String(entry.conversation) === String(conversation._id) && new Date(entry.expiresAt).getTime() > Date.now()
+      )) {
+    return { allowed: false, mode: 'master_authorization' };
+  }
+  if (policy?.mode === 'mobile_only' && device.deviceType !== 'mobile') {
+    return { allowed: false, mode: 'mobile_only' };
+  }
+
   // Mobile-wise encryption/decryption policy (account-level, mobile-wise, NOT chat-wise)
-  const user = await User.findById(userId).select('encryptionMode');
   const encryptionMode = user?.encryptionMode || 'all_devices';
 
   if (encryptionMode === 'mobile_only') {
@@ -46,7 +69,6 @@ export async function emitToAuthorizedConversation(io, conversation, event, payl
       deviceId: socket.deviceId,
       sessionId: socket.sessionId,
       status: 'authorized',
-      linkStatus: 'approved'
     });
     if (!device || !(await conversationAccess(conversation, socket.userId, device, 'new')).allowed) continue;
     socket.emit(event, payload);
@@ -62,7 +84,6 @@ export async function emitToAuthorizedUser(io, userId, conversation, event, payl
       deviceId: socket.deviceId,
       sessionId: socket.sessionId,
       status: 'authorized',
-      linkStatus: 'approved'
     });
     if (!device || !(await conversationAccess(conversation, userId, device, 'new')).allowed) continue;
     socket.emit(event, payload);

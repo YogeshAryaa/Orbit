@@ -17,20 +17,22 @@ export async function requireAuth(req, res, next) {
 
     const deviceId = req.headers['x-device-id'] || p.deviceId;
     const enrolling = req.method === 'POST' && req.path === '/devices';
+    const profileBootstrap = req.method === 'GET' && req.baseUrl === '/api/users' && req.path === '/me';
+    const accountKeyBootstrap = req.baseUrl === '/api/e2ee' && req.path.startsWith('/account-keys');
     if (!p.deviceId || !deviceId || deviceId !== p.deviceId || deviceId !== session.deviceId) {
       throw new ApiError(401, 'This session is not bound to an authorized device');
     }
     const dev = await DeviceKey.findOne({ user: user._id, deviceId });
-    if (!dev && !enrolling) throw new ApiError(401, 'Device is not enrolled');
+    if (!dev && !enrolling && !profileBootstrap && !accountKeyBootstrap) throw new ApiError(401, 'Device is not enrolled');
     if (dev) {
-      if (dev.status === 'revoked' || !enrolling && dev.sessionId && dev.sessionId !== p.sid) {
+      if ((dev.status === 'revoked' && !enrolling && !accountKeyBootstrap) || (!enrolling && !profileBootstrap && !accountKeyBootstrap && dev.status !== 'revoked' && dev.sessionId && dev.sessionId !== p.sid)) {
         throw new ApiError(401, 'This device session has been revoked or replaced');
       }
       const pendingRead = req.method === 'GET' && (
         req.path === '/devices' ||
-        (req.baseUrl === '/api/users' && req.path === '/me')
+        profileBootstrap
       );
-      if (dev.linkStatus === 'pending' && !pendingRead && !enrolling) {
+      if (dev.linkStatus === 'pending' && !pendingRead && !enrolling && !accountKeyBootstrap && !user.accountKeys?.identityPublicKey) {
         throw new ApiError(403, 'This device is awaiting primary-device approval');
       }
       req.device = dev;

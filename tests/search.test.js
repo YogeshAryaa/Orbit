@@ -1,5 +1,3 @@
-import dns from 'dns';
-dns.setServers(['8.8.8.8', '8.8.4.4']);
 import mongoose from 'mongoose';
 import { env } from '../src/config/env.js';
 import User from '../src/models/User.js';

@@ -37,6 +37,16 @@ const clean = (d, includePrekeys = true) => ({
   ...(includePrekeys ? { oneTimePreKeyCount: d.oneTimePreKeys?.length || 0 } : {})
 });
 
+function verifyAccountBackup(identityPublicKey, backup, signature) {
+  try {
+    if (typeof signature !== 'string' || signature.length < 80 || signature.length > 200) return false;
+    const jwk = JSON.parse(Buffer.from(identityPublicKey, 'base64').toString('utf8'));
+    const key = createPublicKey({ key: jwk, format: 'jwk' });
+    const statement = `orbit-account-backup-v1\n${backup.encryptedData}\n${backup.salt}\n${backup.iv}`;
+    return verifySignature('sha256', Buffer.from(statement), { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64'));
+  } catch { return false; }
+}
+
 export async function registerDeviceKeys(req, res) {
   const b = req.body || {};
   if (typeof b.deviceId !== 'string' || b.deviceId.length < 1 || b.deviceId.length > 100) {
@@ -70,6 +80,7 @@ export async function registerDeviceKeys(req, res) {
   const userAgent = req.headers['user-agent'] || '';
   const session = await getSession(req.sessionId, req.user.id);
   const makePrimary = session?.loginMethod === 'phone';
+  const userDoc = await User.findById(req.user.id).select('privacy accountKeys');
 
   // Check if this device already exists
   let existingDoc = await DeviceKey.findOne({ user: req.user.id, deviceId: b.deviceId });
@@ -83,14 +94,32 @@ export async function registerDeviceKeys(req, res) {
   let linkChallenge = '';
 
   if (existingDoc) {
-    // Preserve existing permissions and status
-    historyAllowed = existingDoc.historyAllowed !== false;
-    newMessagesAllowed = existingDoc.newMessagesAllowed !== false;
-    status = existingDoc.status || 'authorized';
-    historyAllowedAt = existingDoc.historyAllowedAt;
-    isPrimary = existingDoc.isPrimary === true;
-    linkStatus = existingDoc.linkStatus || 'approved';
-    linkChallenge = existingDoc.linkChallenge || '';
+    // A fresh authenticated login can restore a previously revoked browser session.
+    if (existingDoc.status === 'revoked') {
+      historyAllowed = true;
+      newMessagesAllowed = true;
+      status = 'authorized';
+      historyAllowedAt = null;
+      isPrimary = existingDoc.isPrimary === true;
+      linkStatus = 'approved';
+      linkChallenge = '';
+    } else {
+      historyAllowed = existingDoc.historyAllowed !== false;
+      newMessagesAllowed = existingDoc.newMessagesAllowed !== false;
+      status = existingDoc.status || 'authorized';
+      historyAllowedAt = existingDoc.historyAllowedAt;
+      isPrimary = existingDoc.isPrimary === true;
+      linkStatus = existingDoc.linkStatus || 'approved';
+      linkChallenge = existingDoc.linkChallenge || '';
+    }
+    if (userDoc?.accountKeys?.identityPublicKey) {
+      historyAllowed = true;
+      newMessagesAllowed = true;
+      status = 'authorized';
+      historyAllowedAt = null;
+      linkStatus = 'approved';
+      linkChallenge = '';
+    }
   } else {
     // New device registration: check if this is user's first device
     const priorDevicesCount = await DeviceKey.countDocuments({
@@ -109,7 +138,9 @@ export async function registerDeviceKeys(req, res) {
       }
     }
 
-    if (priorDevicesCount > 0) {
+    const isStrictPrivacy = userDoc?.privacy?.strictDevicePrivacy === true && !userDoc?.accountKeys?.identityPublicKey;
+
+    if (priorDevicesCount > 0 && isStrictPrivacy) {
       historyAllowed = false;
       newMessagesAllowed = false;
       status = 'authorized';
@@ -117,7 +148,14 @@ export async function registerDeviceKeys(req, res) {
       linkStatus = 'pending';
       linkChallenge = randomUUID();
     } else {
-      isPrimary = true;
+      historyAllowed = true;
+      newMessagesAllowed = true;
+      status = 'authorized';
+      linkStatus = 'approved';
+      linkChallenge = '';
+      if (!primaryExists || priorDevicesCount === 0) {
+        isPrimary = true;
+      }
     }
   }
 
@@ -140,7 +178,9 @@ export async function registerDeviceKeys(req, res) {
         identityPublicKey: b.identityPublicKey,
         signedPreKeyPublic: b.signedPreKeyPublic,
         signedPreKeySignature: b.signedPreKeySignature,
-        ...(b.oneTimePreKeys.length || !existingDoc ? { oneTimePreKeys: b.oneTimePreKeys } : {}),
+        ...(userDoc?.accountKeys?.identityPublicKey
+          ? { oneTimePreKeys: [] }
+          : b.oneTimePreKeys.length || !existingDoc ? { oneTimePreKeys: b.oneTimePreKeys } : {}),
         lastSeenAt: new Date(),
         deviceName,
         os,
@@ -517,42 +557,18 @@ export async function getUserKeyBundles(req, res) {
   assertObjectId(conversationId, 'conversation ID');
   const conversation = await Conversation.findOne({ _id: conversationId, members: { $all: [req.user.id, other] } });
   if (!conversation) throw new ApiError(404, 'User or shared conversation not found');
-  if (!(await conversationAccess(conversation, req.user.id, req.device, 'new')).allowed) {
-    throw new ApiError(403, 'This device is not authorized to request conversation keys');
+  const recipient = await User.findById(other).select('accountKeys status');
+  if (!recipient || recipient.status !== 'active' || !recipient.accountKeys?.identityPublicKey) {
+    return ok(res, [], 'This account has not finished secure setup');
   }
-
-  // Filter devices: only include devices that are authorized to receive new messages and not revoked/blocked
-  const devices = await DeviceKey.find({
-    user: other,
-    newMessagesAllowed: { $ne: false },
-    status: { $nin: ['fully_blocked', 'revoked'] }
-  }).select('+oneTimePreKeys');
-
-  if (!devices.length) throw new ApiError(404, 'No active encryption keys registered for this user');
-
-  const bundles = [];
-  for (const d of devices) {
-    if (d.linkStatus !== 'approved' || !(await conversationAccess(conversation, other, d, 'new')).allowed) continue;
-    let preKey = null;
-    if (d.oneTimePreKeys?.length) {
-      preKey = d.oneTimePreKeys[0];
-      const pulled = await DeviceKey.findOneAndUpdate(
-        { _id: d._id, 'oneTimePreKeys.keyId': preKey.keyId },
-        { $pull: { oneTimePreKeys: { keyId: preKey.keyId } } },
-        { new: false }
-      );
-      if (!pulled) preKey = null;
-    }
-    bundles.push({
-      userId: other,
-      deviceId: d.deviceId,
-      identityPublicKey: d.identityPublicKey,
-      signedPreKeyPublic: d.signedPreKeyPublic,
-      signedPreKeySignature: d.signedPreKeySignature,
-      oneTimePreKey: preKey
-    });
-  }
-  ok(res, bundles, 'Encryption key bundles');
+  ok(res, [{
+    userId: other,
+    deviceId: other,
+    identityPublicKey: recipient.accountKeys.identityPublicKey,
+    signedPreKeyPublic: recipient.accountKeys.signedPreKeyPublic,
+    signedPreKeySignature: recipient.accountKeys.signedPreKeySignature,
+    oneTimePreKey: null
+  }], 'Account encryption key retrieved');
 }
 
 export async function replenishOneTimePreKeys(req, res) {
@@ -585,10 +601,77 @@ export async function getKeyBackup(req, res) {
   }, 'Key backup retrieved');
 }
 
+export async function getAccountKeys(req, res) {
+  const user = await User.findById(req.user.id).select('accountKeys keyBackup');
+  ok(res, { accountKeys: user?.accountKeys || null, keyBackup: user?.keyBackup || null }, 'Account encryption keys retrieved');
+}
+
+export async function createAccountKeys(req, res) {
+  const { identityPublicKey, signedPreKeyPublic, signedPreKeySignature, encryptedData, salt, iv, backupSignature } = req.body || {};
+  for (const [name, value] of Object.entries({ identityPublicKey, signedPreKeyPublic, signedPreKeySignature, encryptedData, salt, iv })) {
+    const minimum = name === 'iv' ? 16 : name === 'salt' ? 22 : 20;
+    const maximum = name === 'encryptedData' ? 1500000 : 4096;
+    if (typeof value !== 'string' || value.length < minimum || value.length > maximum) throw new ApiError(400, `${name} is invalid`);
+  }
+  let signatureValid = false;
+  try {
+    const jwk = JSON.parse(Buffer.from(identityPublicKey, 'base64').toString('utf8'));
+    const key = createPublicKey({ key: jwk, format: 'jwk' });
+    signatureValid = verifySignature('sha256', Buffer.from(signedPreKeyPublic), { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(signedPreKeySignature, 'base64'));
+  } catch { signatureValid = false; }
+  if (!signatureValid) throw new ApiError(400, 'Account signed prekey signature is invalid');
+  if (!verifyAccountBackup(identityPublicKey, { encryptedData, salt, iv }, backupSignature)) {
+    throw new ApiError(400, 'Account backup signature is invalid');
+  }
+  const user = await User.findOneAndUpdate(
+    { _id: req.user.id, $or: [{ 'accountKeys.identityPublicKey': null }, { 'accountKeys.identityPublicKey': { $exists: false } }] },
+    { $set: {
+      'accountKeys.identityPublicKey': identityPublicKey,
+      'accountKeys.signedPreKeyPublic': signedPreKeyPublic,
+      'accountKeys.signedPreKeySignature': signedPreKeySignature,
+      'privacy.strictDevicePrivacy': false,
+      'keyBackup.encryptedData': encryptedData,
+      'keyBackup.salt': salt,
+      'keyBackup.iv': iv,
+      'keyBackup.updatedAt': new Date()
+    } },
+    { new: true }
+  );
+  if (!user) throw new ApiError(409, 'Account encryption keys are already set up');
+  await SecurityAuditEvent.create({ user: req.user.id, action: 'account_keys_created', targetType: 'account', targetId: req.user.id });
+  ok(res, { accountKeys: user.accountKeys, keyBackup: user.keyBackup }, 'Account encryption keys created');
+}
+
+export async function updateAccountKeyBackup(req, res) {
+  const { encryptedData, salt, iv, backupSignature } = req.body || {};
+  for (const [name, value] of Object.entries({ encryptedData, salt, iv })) {
+    const minimum = name === 'iv' ? 16 : name === 'salt' ? 22 : 20;
+    const maximum = name === 'encryptedData' ? 1500000 : 4096;
+    if (typeof value !== 'string' || value.length < minimum || value.length > maximum) throw new ApiError(400, `${name} is invalid`);
+  }
+  const current = await User.findById(req.user.id).select('accountKeys');
+  if (!current?.accountKeys?.identityPublicKey) throw new ApiError(409, 'Set up account encryption before saving its backup');
+  if (!verifyAccountBackup(current.accountKeys.identityPublicKey, { encryptedData, salt, iv }, backupSignature)) {
+    throw new ApiError(403, 'Account backup signature could not be verified');
+  }
+  const user = await User.findOneAndUpdate(
+    { _id: req.user.id, 'accountKeys.identityPublicKey': { $type: 'string' } },
+    { $set: { 'keyBackup.encryptedData': encryptedData, 'keyBackup.salt': salt, 'keyBackup.iv': iv, 'keyBackup.updatedAt': new Date() } },
+    { new: true }
+  ).select('accountKeys keyBackup');
+  if (!user) throw new ApiError(409, 'Set up account encryption before saving its backup');
+  await SecurityAuditEvent.create({ user: req.user.id, action: 'account_key_backup_updated', targetType: 'account', targetId: req.user.id });
+  ok(res, { accountKeys: user.accountKeys, keyBackup: user.keyBackup }, 'Account key backup updated');
+}
+
 export async function saveKeyBackup(req, res) {
-  const { encryptedData, salt, iv, encryptionMode } = req.body || {};
+  const { encryptedData, salt, iv, encryptionMode, backupSignature } = req.body || {};
   if (!encryptedData || !salt || !iv) {
     throw new ApiError(400, 'encryptedData, salt, and iv are required for key backup');
+  }
+  const owner = await User.findById(req.user.id).select('accountKeys');
+  if (!owner?.accountKeys?.identityPublicKey || !verifyAccountBackup(owner.accountKeys.identityPublicKey, { encryptedData, salt, iv }, backupSignature)) {
+    throw new ApiError(403, 'Account backup signature could not be verified');
   }
   const update = {
     'keyBackup.encryptedData': encryptedData,

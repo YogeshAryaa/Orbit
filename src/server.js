@@ -1,8 +1,4 @@
 
-import dns from 'node:dns';
-
-dns.setServers(['8.8.8.8', '8.8.4.4']);
-
 import http from 'node:http';
 import { Server } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';

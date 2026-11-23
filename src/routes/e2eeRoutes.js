@@ -14,6 +14,9 @@ import {
   getUserKeyBundles,
   replenishOneTimePreKeys,
   getKeyBackup,
+  getAccountKeys,
+  createAccountKeys,
+  updateAccountKeyBackup,
   saveKeyBackup,
   updateEncryptionMode
 } from '../controllers/e2eeController.js';
@@ -41,6 +44,9 @@ r.post('/devices/tabs/sync', asyncHandler(syncTab));
 r.patch('/devices/:deviceId/tabs/:tabId', asyncHandler(updateTabStatus));
 r.post('/devices/authorize-history', asyncHandler(authorizeHistoryEnvelopes));
 r.post('/devices/prekeys', asyncHandler(replenishOneTimePreKeys));
+r.get('/account-keys', asyncHandler(getAccountKeys));
+r.post('/account-keys', asyncHandler(createAccountKeys));
+r.put('/account-keys/backup', asyncHandler(updateAccountKeyBackup));
 r.get('/users/:userId/bundles', asyncHandler(getUserKeyBundles));
 r.get('/key-backup', asyncHandler(getKeyBackup));
 r.post('/key-backup', asyncHandler(saveKeyBackup));

@@ -74,8 +74,15 @@ export async function getAllStatuses(req, res) {
 
 export async function viewStatus(req, res) {
   assertObjectId(req.params.id, 'status ID');
-  const status = await Status.findById(req.params.id);
+  const currentUser = await User.findById(req.user.id).select('blockedUsers');
+  const blockedUsers = currentUser?.blockedUsers || [];
+  const status = await Status.findOne({
+    _id: req.params.id,
+    expiresAt: { $gt: new Date() },
+    user: { $nin: [req.user.id, ...blockedUsers] }
+  });
   if (!status) throw new ApiError(404, 'Status not found');
+  if (await User.exists({ _id: status.user, blockedUsers: req.user.id })) throw new ApiError(404, 'Status not found');
 
   const updated = await Status.findByIdAndUpdate(
     req.params.id,
